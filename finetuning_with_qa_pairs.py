@@ -1,4 +1,4 @@
-# qlora_finetune_verbose.py
+# qlora_finetune_safe.py
 
 import json
 from datasets import Dataset
@@ -7,32 +7,41 @@ from peft import LoraConfig, get_peft_model, TaskType
 import torch
 
 # ------------------------------
-# 1️⃣ Load your JSONL Q&A data
+# 1️⃣ Load your JSONL Q&A data safely
 # ------------------------------
-jsonl_file = r"D:\RAG Projects\vamshi\RAFT\data\QAPairs\qa_pairs.jsonl"  # Path to your JSONL file
-
+jsonl_file = r"D:\RAG Projects\vamshi\RAFT\data\QAPairs\qa_pairs.jsonl"
 data = []
+
 with open(jsonl_file, "r", encoding="utf-8") as f:
-    for line in f:
-        item = json.loads(line)
-        prompt = f"Question: {item['question']}\nAnswer:"
-        completion = f" {item['answer']}"
+    for line_number, line in enumerate(f, start=1):
+        line = line.strip()  # remove leading/trailing spaces
+        if not line:  # skip empty lines
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError as e:
+            print(f"⚠️ Skipping invalid line {line_number}: {line}\nError: {e}")
+            continue
+        prompt = f"Question: {item.get('question','')}\nAnswer:"
+        completion = f" {item.get('answer','')}"
         data.append({"input_text": prompt, "target_text": completion})
 
-dataset = Dataset.from_list(data)
+if not data:
+    raise ValueError("No valid Q&A pairs found in your JSONL file!")
 
-print(f"✅ Total examples loaded: {len(dataset)}")
+dataset = Dataset.from_list(data)
+print(f"✅ Total valid examples loaded: {len(dataset)}")
 print(f"Sample Q&A pair:\n{dataset[0]}")
 
 # ------------------------------
 # 2️⃣ Load tokenizer and model locally
 # ------------------------------
-model_path = r"D:/Machine Learning and LLMs/LLMs/Mistral-7B-Instruct-v0.2"  # Path to your downloaded Mistral model
+model_path = r"D:/RAG Projects/vamshi/RAFT/data/mistral-7b"  # Path to your local Mistral model
 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
 model = AutoModelForCausalLM.from_pretrained(
     model_path,
     device_map="auto",
-    load_in_8bit=True  # QLoRA works with 8-bit or 4-bit
+    load_in_8bit=True  # QLoRA works with 8-bit
 )
 
 print(f"✅ Model loaded: {model.__class__.__name__}")
@@ -45,7 +54,7 @@ lora_config = LoraConfig(
     task_type=TaskType.CAUSAL_LM,
     r=16,
     lora_alpha=32,
-    target_modules=["q_proj", "v_proj"],
+    target_modules=["q_proj", "v_proj"],  # Mistral attention layers
     lora_dropout=0.05,
     bias="none",
     dtype="float16"
@@ -88,21 +97,22 @@ data_collator = DataCollatorForSeq2Seq(tokenizer, model=model, padding=True)
 # ------------------------------
 class PrintLossCallback(TrainerCallback):
     def on_step_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):
-        if state.global_step % 1 == 0:  # print every step
-            logs = {k: v for k, v in state.log_history[-1].items()} if state.log_history else {}
-            print(f"Step {state.global_step}, Logs: {logs}")
+        if state.log_history:
+            last_log = state.log_history[-1]
+            if "loss" in last_log:
+                print(f"Step {state.global_step}, Loss: {last_log['loss']:.4f}")
 
 # ------------------------------
 # 7️⃣ Training arguments
 # ------------------------------
 training_args = TrainingArguments(
     output_dir="./mistral_qlora_qa",
-    per_device_train_batch_size=2,
+    per_device_train_batch_size=2,  # Adjust based on GPU memory
     gradient_accumulation_steps=8,
     learning_rate=2e-4,
     num_train_epochs=3,
     fp16=True,
-    logging_steps=1,   # log every step
+    logging_steps=1,  # log every step
     save_steps=500,
     save_total_limit=2,
     remove_unused_columns=False,
