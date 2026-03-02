@@ -1,0 +1,726 @@
+# ================= OFFLINE SETTINGS (MUST BE FIRST) =================
+import os
+
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["HF_DATASETS_OFFLINE"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["HF_HOME"] = "./hf_cache"
+os.environ["TRANSFORMERS_CACHE"] = "./hf_cache"
+
+# ================= IMPORTS =================
+import re
+import sys
+import numpy as np
+import torch
+import chromadb
+from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from peft import PeftModel
+from pathlib import Path
+from typing import List, Tuple
+
+# ================= PATHS =================
+BASE_DIR = Path(__file__).resolve().parent
+
+BASE_MODEL_PATH = r"E:\llms\Qwen2-1.5B-Instruct"
+ADAPTER_PATH    = str(BASE_DIR / "models" / "qwen_qlora_adapters")
+EMBED_PATH      = r"D:\Machine Learning and LLMs\LLMs\all-MiniLM-L6-v2"
+CHROMA_DIR      = str(BASE_DIR / "chroma_store")
+COLLECTION_NAME = "pdf_markdown_embeddings"
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Device: {device}")
+
+# ================= LOAD EMBEDDER =================
+print("Loading embedder (OFFLINE)...")
+embedder = SentenceTransformer(EMBED_PATH, device="cuda", local_files_only=True)
+print("✅ Embedder loaded")
+
+# ================= LOAD CHROMA =================
+print("Loading ChromaDB...")
+client = chromadb.PersistentClient(path=CHROMA_DIR)
+collection = client.get_collection(COLLECTION_NAME)
+print(f"✅ Collection loaded — {collection.count()} chunks")
+
+# ── Validate distance metric at startup (fail fast)
+space = (collection.metadata or {}).get("hnsw:space", "l2")
+print(f"   Distance metric: {space}")
+if space != "cosine":
+    print(
+        f"\n⛔  FATAL: Collection metric is '{space}', expected 'cosine'.\n"
+        "    Re-run embeddings.py to recreate the collection with the correct metric.\n"
+        "    Do NOT continue — retrieval results will be meaningless.\n"
+    )
+    sys.exit(1)
+
+# ================= LOAD FINE-TUNED LLM =================
+print("Loading Qwen model...")
+use_finetuned = os.path.exists(ADAPTER_PATH)
+
+if use_finetuned:
+    print("✓ Adapters found — loading with QLoRA...")
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
+    )
+    base_model = AutoModelForCausalLM.from_pretrained(
+        BASE_MODEL_PATH,
+        quantization_config=bnb_config,
+        device_map="auto",
+        local_files_only=True,
+        trust_remote_code=True,
+    )
+    model = PeftModel.from_pretrained(base_model, ADAPTER_PATH)
+    print("✅ Fine-tuned Qwen loaded")
+else:
+    print("⚠  No adapters — loading base model...")
+    model = AutoModelForCausalLM.from_pretrained(
+        BASE_MODEL_PATH,
+        torch_dtype=torch.float16,
+        device_map="auto",
+        local_files_only=True,
+        trust_remote_code=True,
+    )
+    print("✅ Base Qwen loaded")
+
+# ================= TOKENIZER =================
+tokenizer = AutoTokenizer.from_pretrained(
+    BASE_MODEL_PATH, local_files_only=True, trust_remote_code=True
+)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token    = tokenizer.eos_token
+    tokenizer.pad_token_id = tokenizer.eos_token_id
+
+# ================= ENHANCED RETRIEVAL =================
+def retrieve_with_reranking(query: str, k: int = 10, top_k: int = 5, 
+                           threshold: float = 0.45, verbose: bool = True) -> Tuple[List[str], List[float]]:
+    """
+    Enhanced retrieval with semantic reranking and better filtering.
+    
+    Args:
+        query: The search query
+        k: Number of initial candidates to retrieve
+        top_k: Number of final chunks to return after reranking
+        threshold: Minimum cosine similarity threshold (raised from 0.35)
+        verbose: Print debug information
+    
+    Returns:
+        Tuple of (documents, similarity_scores)
+    """
+    # Embed query
+    q_vec = embedder.encode(
+        [query],
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+    ).tolist()
+
+    if verbose:
+        print(f"Query vector norm: {np.linalg.norm(q_vec[0]):.4f}")
+
+    # Query ChromaDB with more candidates
+    results = collection.query(
+        query_embeddings=q_vec,
+        n_results=k,
+        include=["documents", "distances", "metadatas"],
+    )
+
+    docs      = results["documents"][0]
+    distances = results["distances"][0]
+    metadatas = results.get("metadatas", [[{}] * len(docs)])[0]
+
+    # Calculate similarities and apply keyword boost
+    candidates = []
+    query_terms = set(query.lower().split())
+    
+    for doc, dist, meta in zip(docs, distances, metadatas):
+        similarity = 1.0 - (dist / 2.0)
+        
+        # Keyword boost: increase score if query terms appear in document
+        doc_lower = doc.lower()
+        keyword_matches = sum(1 for term in query_terms if term in doc_lower)
+        keyword_boost = min(0.1 * keyword_matches, 0.2)  # Max 20% boost
+        
+        boosted_similarity = min(similarity + keyword_boost, 1.0)
+        
+        candidates.append({
+            'doc': doc,
+            'similarity': similarity,
+            'boosted_similarity': boosted_similarity,
+            'metadata': meta
+        })
+    
+    # Sort by boosted similarity
+    candidates.sort(key=lambda x: x['boosted_similarity'], reverse=True)
+    
+    if verbose:
+        print("\n📊 Retrieval Results:")
+        print(f"{'Rank':<5} {'Distance':<10} {'Sim':<8} {'Boosted':<8} {'Content':<50}")
+        print("-" * 80)
+        for i, cand in enumerate(candidates[:top_k], 1):
+            orig_sim = cand['similarity']
+            boost_sim = cand['boosted_similarity']
+            content = cand['doc'][:45] + "..." if len(cand['doc']) > 45 else cand['doc']
+            print(f"{i:<5} {(2*(1-orig_sim)):<10.4f} {orig_sim:<8.4f} {boost_sim:<8.4f} {content:<50}")
+    
+    # Apply stricter threshold
+    filtered = []
+    scores = []
+    
+    # Always check if top result meets minimum quality
+    if candidates and candidates[0]['boosted_similarity'] < 0.5:
+        print(f"\n⚠ Weak retrieval (top similarity={candidates[0]['boosted_similarity']:.3f})")
+        return [], []
+    
+    for cand in candidates[:top_k]:
+        if cand['boosted_similarity'] >= threshold:
+            filtered.append(cand['doc'])
+            scores.append(cand['boosted_similarity'])
+    
+    print(f"\n🔎 Retrieved {len(filtered)} / {top_k} chunks (threshold={threshold})")
+    return filtered, scores
+
+# ================= IMPROVED CONTEXT CLEANING =================
+def clean_context(context: str, preserve_structure: bool = True) -> str:
+    """
+    Improved context cleaning that preserves important information.
+    
+    Args:
+        context: Raw context string
+        preserve_structure: Keep paragraph structure and important short lines
+    """
+    cleaned = []
+    lines = context.splitlines()
+    
+    for i, line in enumerate(lines):
+        line = line.strip()
+        
+        # Skip empty lines
+        if not line:
+            if preserve_structure and cleaned and cleaned[-1] != "":
+                cleaned.append("")  # Preserve paragraph breaks
+            continue
+        
+        # Skip obvious noise
+        lower = line.lower()
+        if any(phrase in lower for phrase in [
+            "page intentionally left blank",
+            "this page intentionally",
+            "continued on next page"
+        ]):
+            continue
+        
+        # Keep headers, bullet points, and numbered items even if short
+        if re.match(r'^(\d+\.|\*|-|•|[A-Z][A-Z\s]+:)', line):
+            cleaned.append(line)
+            continue
+        
+        # Keep lines with technical content (even if short)
+        if any(char in line for char in ['=', ':', '(', ')', '%', '@']):
+            cleaned.append(line)
+            continue
+        
+        # For other lines, apply length filter more intelligently
+        if len(line) < 20 and not any(c.isdigit() for c in line):
+            # Skip very short lines without numbers
+            continue
+        
+        cleaned.append(line)
+    
+    # Remove multiple consecutive empty lines
+    final = []
+    prev_empty = False
+    for line in cleaned:
+        if line == "":
+            if not prev_empty:
+                final.append(line)
+            prev_empty = True
+        else:
+            final.append(line)
+            prev_empty = False
+    
+    return "\n".join(final)
+
+# ================= CONTEXT VALIDATION =================
+def validate_context_relevance(context: str, question: str) -> float:
+    """
+    Validate that the retrieved context is relevant to the question.
+    
+    Returns:
+        Relevance score between 0 and 1
+    """
+    question_terms = set(question.lower().split())
+    context_lower = context.lower()
+    
+    # Check how many question terms appear in context
+    matches = sum(1 for term in question_terms 
+                 if len(term) > 3 and term in context_lower)
+    
+    relevance = matches / max(len(question_terms), 1)
+    return relevance
+
+# ================= ENHANCED PROMPT BUILDER =================
+def build_prompt(context: str, question: str, qtype: str, similarity_score: float = None) -> str:
+    """
+    Build an enhanced prompt that encourages accuracy and grounding.
+    """
+    style_map = {
+        "definition":  "Provide a precise technical definition using exact terminology from the context.",
+        "explanation": "Provide a comprehensive explanation using specific details from the context.",
+        "procedure":   "List the exact steps or procedures as described in the context.",
+        "list":        "List all relevant points mentioned in the context with their details.",
+        "general":     "Answer comprehensively using the specific information provided in the context.",
+    }
+    
+    # Add confidence indicator based on retrieval quality
+    confidence_note = ""
+    if similarity_score:
+        if similarity_score < 0.6:
+            confidence_note = "\nNote: The retrieved context may have limited relevance. Be especially careful to use ONLY what is explicitly stated."
+        elif similarity_score > 0.8:
+            confidence_note = "\nNote: High confidence retrieval. Focus on accuracy and completeness."
+    
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a technical expert assistant. Your responses must be 100% grounded in the provided context.\n\n"
+                "CRITICAL RULES:\n"
+                "1. Use ONLY information explicitly stated in the context below.\n"
+                "2. Quote or paraphrase directly from the context when possible.\n"
+                "3. Do NOT add any information not present in the context.\n"
+                "4. Do NOT make assumptions or inferences beyond what is stated.\n"
+                "5. If information is incomplete or unclear in the context, acknowledge this.\n"
+                "6. If the context does not contain enough information to fully answer, say:\n"
+                "   'Based on the available information: [partial answer]' or\n"
+                "   'The provided context does not contain sufficient information to answer this question.'\n\n"
+                f"Response style: {style_map[qtype]}"
+                f"{confidence_note}"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"### CONTEXT (Use ONLY this information):\n{context}\n\n"
+                f"### QUESTION:\n{question}\n\n"
+                "### ANSWER (based strictly on the context above):"
+            ),
+        },
+    ]
+
+    return tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+
+# ================= ENHANCED GENERATION =================
+def generate_answer(context: str, question: str, similarity_score: float = None) -> str:
+    """
+    Generate answer with improved accuracy and grounding.
+    """
+    qtype   = detect_question_type(question)
+    context = clean_context(context, preserve_structure=True)
+    
+    # Validate context relevance
+    relevance = validate_context_relevance(context, question)
+    if relevance < 0.1:
+        return "The retrieved context does not appear to contain relevant information for this question."
+    
+    if not context.strip() or len(context.split()) < 20:
+        return "Insufficient context available to answer this question."
+
+    prompt = build_prompt(context, question, qtype, similarity_score)
+    
+    # Tokenize with proper truncation
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=2048,
+    ).to(device)
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=400,
+            do_sample=True,
+            temperature=0.3,  # Lower temperature for more focused answers
+            top_p=0.85,       # Slightly lower for more deterministic output
+            top_k=30,         # Add top_k for additional control
+            repetition_penalty=1.15,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+
+    generated_tokens = outputs[0][inputs["input_ids"].shape[-1]:]
+    answer = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+
+    # Clean up answer
+    answer = clean_generated_answer(answer)
+    
+    # Validate answer quality
+    if not validate_answer(answer, context, question):
+        return "Unable to provide a reliable answer based on the available context."
+    
+    return answer
+
+def clean_generated_answer(answer: str) -> str:
+    """
+    Clean and post-process generated answer.
+    """
+    # Remove chat template artifacts
+    if "<|im_start|>assistant" in answer:
+        answer = answer.split("<|im_start|>assistant")[-1]
+    if "<|im_end|>" in answer:
+        answer = answer.split("<|im_end|>")[0]
+    
+    # Remove any system-like responses that leaked
+    lines = answer.split('\n')
+    cleaned_lines = []
+    for line in lines:
+        if any(phrase in line.lower() for phrase in [
+            "based on the context", "according to the context",
+            "the context states", "from the context"
+        ]):
+            # Keep the line but remove the phrase
+            for phrase in ["based on the context,", "according to the context,", 
+                          "the context states that", "from the context,"]:
+                line = line.replace(phrase, "")
+                line = line.replace(phrase.capitalize(), "")
+            line = line.strip()
+            if line:
+                cleaned_lines.append(line)
+        else:
+            cleaned_lines.append(line)
+    
+    answer = '\n'.join(cleaned_lines).strip()
+    
+    # Ensure complete sentences
+    answer = ensure_complete_sentence(answer)
+    
+    return answer
+
+def validate_answer(answer: str, context: str, question: str) -> bool:
+    """
+    Validate that the answer is grounded in context and not hallucinated.
+    """
+    if not answer or len(answer.split()) < 5:
+        return False
+    
+    # Check if answer contains specific terms from context
+    context_terms = set(context.lower().split())
+    answer_terms = set(answer.lower().split())
+    
+    # At least 30% of answer terms should be from context
+    overlap = len(answer_terms & context_terms)
+    if overlap / max(len(answer_terms), 1) < 0.3:
+        return False
+    
+    # Check for common hallucination patterns
+    hallucination_phrases = [
+        "as an ai", "i cannot", "i don't have access",
+        "based on my training", "in general", "typically"
+    ]
+    
+    answer_lower = answer.lower()
+    if any(phrase in answer_lower for phrase in hallucination_phrases):
+        return False
+    
+    return True
+
+# ================= QUESTION TYPE DETECTION =================
+def detect_question_type(question: str) -> str:
+    """
+    Enhanced question type detection for better prompt engineering.
+    """
+    q = question.lower()
+    
+    # Check for specific patterns
+    if any(q.startswith(p) for p in ["what is", "what are", "define", "meaning of"]):
+        return "definition"
+    if any(q.startswith(p) for p in ["explain", "describe", "tell me about", "overview"]):
+        return "explanation"
+    if any(q.startswith(p) for p in ["how do", "how to", "how does", "procedure", "steps", "process"]):
+        return "procedure"
+    if any(w in q for w in ["list", "enumerate", "what are all", "mention all"]):
+        return "list"
+    if any(w in q for w in ["safety", "measures", "precautions", "guidelines", "requirements"]):
+        return "list"
+    if any(w in q for w in ["why", "reason", "cause", "purpose"]):
+        return "explanation"
+    if any(w in q for w in ["when", "where", "who", "which"]):
+        return "general"
+    
+    return "general"
+
+# ================= COMPLETE SENTENCE =================
+def ensure_complete_sentence(text: str) -> str:
+    """
+    Ensure text ends with proper punctuation.
+    """
+    if not text:
+        return text
+        
+    text = text.strip()
+    
+    # If already ends with punctuation, return as is
+    if text[-1] in ".!?":
+        return text
+    
+    # Find last complete sentence
+    matches = list(re.finditer(r'[.!?](?:\s|$)', text))
+    if matches:
+        last_sentence_end = matches[-1].end()
+        return text[:last_sentence_end].strip()
+    
+    # If no sentence ending found but text is substantial, add period
+    if len(text.split()) > 5:
+        return text + "."
+    
+    return text
+
+# ================= ENHANCED RAG PIPELINE =================
+def ask(question: str, threshold: float = 0.45, use_reranking: bool = True) -> str:
+    """
+    Enhanced RAG pipeline with better retrieval and answer generation.
+    
+    Args:
+        question: The user's question
+        threshold: Minimum similarity threshold (raised from 0.35)
+        use_reranking: Whether to use semantic reranking
+    """
+    print(f"\n{'='*60}")
+    print(f"QUERY: {question}")
+    print('='*60)
+
+    # Retrieve with enhanced method
+    if use_reranking:
+        docs, scores = retrieve_with_reranking(
+            question, 
+            k=12,  # Get more candidates
+            top_k=6,  # Return top 6 after reranking
+            threshold=threshold
+        )
+    else:
+        # Fallback to original retrieval
+        docs = retrieve(question, k=8, threshold=threshold)
+        scores = [threshold] * len(docs)  # Dummy scores
+    
+    if not docs:
+        # Try with lower threshold as last resort
+        print(f"⚠  No results at threshold={threshold}. Trying {threshold-0.15}...")
+        if use_reranking:
+            docs, scores = retrieve_with_reranking(
+                question, k=15, top_k=8, threshold=threshold-0.15, verbose=False
+            )
+        else:
+            docs = retrieve(question, k=10, threshold=threshold-0.15, verbose=False)
+            scores = [threshold-0.15] * len(docs)
+            
+        if not docs:
+            return "I don't have sufficient information in the knowledge base to answer this question."
+    
+    # Combine retrieved chunks with deduplication
+    seen = set()
+    unique_docs = []
+    for doc in docs:
+        # Simple deduplication based on first 100 chars
+        key = doc[:100] if len(doc) > 100 else doc
+        if key not in seen:
+            seen.add(key)
+            unique_docs.append(doc)
+    
+    context = "\n\n---\n\n".join(unique_docs)
+    
+    # Check context quality
+    if len(context.split()) < 30:
+        return "The retrieved information is too limited to provide a reliable answer."
+    
+    # Generate answer with average similarity score
+    avg_score = sum(scores) / len(scores) if scores else 0
+    return generate_answer(context, question, avg_score)
+
+# ================= ORIGINAL RETRIEVE FUNCTION (KEPT FOR COMPATIBILITY) =================
+def retrieve(query: str, k: int = 5, threshold: float = 0.35,
+             verbose: bool = True) -> list[str]:
+    """
+    Original retrieve function - kept for backward compatibility.
+    Consider using retrieve_with_reranking instead.
+    """
+    # Embed query
+    q_vec = embedder.encode(
+        [query],
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+    ).tolist()
+
+    if verbose:
+        print(f"Query vector norm: {np.linalg.norm(q_vec[0]):.4f}")
+
+    # Query ChromaDB
+    results = collection.query(
+        query_embeddings=q_vec,
+        n_results=k,
+        include=["documents", "distances"],
+    )
+
+    docs      = results["documents"][0]
+    distances = results["distances"][0]
+
+    filtered_docs = []
+    similarities = []
+
+    for rank, (doc, dist) in enumerate(zip(docs, distances), 1):
+        similarity = 1.0 - (dist / 2.0)
+        similarities.append(similarity)
+
+        if verbose:
+            print(f"{rank:<5} {dist:>8.4f} {similarity:>11.4f}  {doc[:55]}...")
+
+    # Hard guard
+    top_similarity = similarities[0] if similarities else 0
+    if top_similarity < 0.55:
+        print(f"⚠ Weak retrieval (top similarity={top_similarity:.3f})")
+        return []
+
+    for doc, sim in zip(docs, similarities):
+        if sim >= threshold:
+            filtered_docs.append(doc)
+    
+    print(f"\n🔎 Retrieved {len(filtered_docs)} / {len(docs)} chunks "
+          f"(threshold={threshold})")
+    
+    return filtered_docs
+
+# ================= IMPROVED STARTUP DIAGNOSTIC =================
+def run_startup_diagnostic():
+    """
+    Enhanced diagnostic that checks embedding quality and retrieval performance.
+    """
+    print("\n" + "="*60)
+    print(" STARTUP DIAGNOSTIC")
+    print("="*60)
+
+    try:
+        # 1. Check stored vectors
+        sample = collection.get(limit=10, include=["embeddings", "documents"])
+        
+        if not sample["embeddings"]:
+            print("❌ ERROR: No embeddings found in collection!")
+            return
+        
+        # Check dimensions
+        embed_dim = len(sample["embeddings"][0])
+        print(f"✓ Embedding dimension: {embed_dim}")
+        
+        # Check normalization
+        norms = [np.linalg.norm(e) for e in sample["embeddings"]]
+        avg_norm = np.mean(norms)
+        std_norm = np.std(norms)
+        
+        print(f"✓ Vector norms: mean={avg_norm:.4f}, std={std_norm:.4f}")
+        
+        if not all(0.95 < n < 1.05 for n in norms[:5]):
+            print("⚠ WARNING: Vectors may not be properly normalized!")
+            print("  Consider re-running embeddings.py with normalize_embeddings=True")
+        else:
+            print("✓ Vectors are properly normalized")
+        
+        # 2. Test self-retrieval
+        print("\n📊 Self-Retrieval Test:")
+        test_doc = sample["documents"][0]
+        test_snippet = test_doc[:200] if len(test_doc) > 200 else test_doc
+        
+        q_vec = embedder.encode(
+            [test_snippet], 
+            normalize_embeddings=True,
+            convert_to_numpy=True
+        ).tolist()
+        
+        res = collection.query(
+            query_embeddings=q_vec, 
+            n_results=3,
+            include=["documents", "distances"]
+        )
+        
+        if res["documents"][0]:
+            first_match = res["documents"][0][0]
+            dist = res["distances"][0][0]
+            sim = 1.0 - (dist / 2.0)
+            
+            print(f"  Distance: {dist:.4f}")
+            print(f"  Similarity: {sim:.4f}")
+            
+            if first_match[:100] == test_doc[:100]:
+                print("✓ Exact match found - retrieval working correctly")
+            elif sim > 0.9:
+                print("✓ High similarity match - retrieval working")
+            else:
+                print("⚠ WARNING: Self-retrieval similarity is low!")
+                print("  This may indicate an embedding model mismatch")
+        
+        # 3. Test embedding consistency
+        print("\n🔍 Embedding Consistency Test:")
+        test_text = "This is a test sentence for embedding consistency"
+        
+        emb1 = embedder.encode([test_text], normalize_embeddings=True)
+        emb2 = embedder.encode([test_text], normalize_embeddings=True)
+        
+        consistency = np.dot(emb1[0], emb2[0])
+        print(f"  Consistency score: {consistency:.6f}")
+        
+        if consistency > 0.9999:
+            print("✓ Embeddings are deterministic and consistent")
+        else:
+            print("⚠ WARNING: Embeddings may not be deterministic!")
+        
+        print("\n" + "="*60)
+        print(" DIAGNOSTIC COMPLETE")
+        print("="*60 + "\n")
+        
+    except Exception as e:
+        print(f"❌ Diagnostic failed: {e}")
+        print("Please check your ChromaDB and embedding setup")
+
+# ================= MAIN =================
+if __name__ == "__main__":
+    run_startup_diagnostic()
+
+    model_type = "Fine-tuned" if use_finetuned else "Base"
+    print(f"\n✅ Enhanced RAG System Ready")
+    print(f"   Model: {model_type} Qwen2-1.5B")
+    print(f"   Device: {device.upper()}")
+    print(f"   Chunks: {collection.count()}")
+    print("\nType 'exit' or 'quit' to stop.")
+    print("Type 'help' for usage tips.\n")
+
+    while True:
+        try:
+            q = input(">>> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting...")
+            break
+
+        if not q:
+            continue
+            
+        if q.lower() in ("exit", "quit", "q"):
+            print("Goodbye!")
+            break
+            
+        if q.lower() == "help":
+            print("\nUsage Tips:")
+            print("- Ask specific questions about the content")
+            print("- Use keywords from the training material")
+            print("- For better results, be specific rather than general")
+            print("- The system works best with technical questions\n")
+            continue
+
+        # Process query with enhanced pipeline
+        answer = ask(q, threshold=0.45, use_reranking=True)
+        
+        # Format output
+        print(f"\n{'─'*60}")
+        print(f"Answer:\n{answer}")
+        print(f"{'─'*60}\n")
