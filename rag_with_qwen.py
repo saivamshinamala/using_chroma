@@ -2,11 +2,11 @@
 import os
 
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["HF_DATASETS_OFFLINE"] = "1"
+os.environ["HF_HUB_OFFLINE"]       = "1"
+os.environ["HF_DATASETS_OFFLINE"]  = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["HF_HOME"] = "./hf_cache"
-os.environ["TRANSFORMERS_CACHE"] = "./hf_cache"
+os.environ["HF_HOME"]              = "./hf_cache"
+os.environ["TRANSFORMERS_CACHE"]   = "./hf_cache"
 
 # ================= IMPORTS =================
 import re
@@ -14,7 +14,7 @@ import sys
 import numpy as np
 import torch
 import chromadb
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import PeftModel
 from pathlib import Path
@@ -23,34 +23,56 @@ from typing import List, Tuple, Optional
 # ================= PATHS =================
 BASE_DIR = Path(__file__).resolve().parent
 
-BASE_MODEL_PATH = r"E:\llms\Qwen2-1.5B-Instruct"
-ADAPTER_PATH    = str(BASE_DIR / "models" / "qwen_qlora_adapters")
-EMBED_PATH      = r"D:\Machine Learning and LLMs\LLMs\all-MiniLM-L6-v2"
+BASE_MODEL_PATH  = r"E:\llms\Qwen2-7B-Instruct"
+ADAPTER_PATH     = str(BASE_DIR / "models" / "qwen_qlora_adapters")
+EMBED_PATH       = r"D:\Machine Learning and LLMs\LLMs\bge-large-en-v1.5"
+
+# ── Cross-encoder path ─────────────────────────────────────────────────────
+# Download once:  sentence-transformers download cross-encoder/ms-marco-MiniLM-L-6-v2
+# Then set this path to wherever you saved it locally.
+CROSS_ENCODER_PATH = r"D:\Machine Learning and LLMs\LLMs\cross-encoder-ms-marco-MiniLM-L-6-v2"
+
 CHROMA_DIR      = str(BASE_DIR / "chroma_store")
 COLLECTION_NAME = "pdf_markdown_embeddings"
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Device: {device}")
 
-# ================= LOAD EMBEDDER =================
-print("Loading embedder (OFFLINE)...")
+# ================= LOAD BI-ENCODER (embedder) =================
+print("Loading bi-encoder embedder (OFFLINE)...")
 embedder = SentenceTransformer(EMBED_PATH, device="cuda", local_files_only=True)
-print("✅ Embedder loaded")
+print("✅ Bi-encoder loaded")
+
+# ================= LOAD CROSS-ENCODER (reranker) =================
+print("Loading cross-encoder reranker (OFFLINE)...")
+cross_encoder_available = False
+reranker = None
+
+try:
+    reranker = CrossEncoder(
+        CROSS_ENCODER_PATH,
+        max_length=512,
+        device=device,
+    )
+    cross_encoder_available = True
+    print("✅ Cross-encoder reranker loaded")
+except Exception as e:
+    print(f"⚠  Cross-encoder not loaded: {e}")
+    print("   Falling back to bi-encoder + keyword boost reranking.")
+    print(f"   To fix: download 'cross-encoder/ms-marco-MiniLM-L-6-v2' and set CROSS_ENCODER_PATH")
 
 # ================= LOAD CHROMA =================
 print("Loading ChromaDB...")
-client = chromadb.PersistentClient(path=CHROMA_DIR)
+client     = chromadb.PersistentClient(path=CHROMA_DIR)
 collection = client.get_collection(COLLECTION_NAME)
 print(f"✅ Collection loaded — {collection.count()} chunks")
 
-# ── Validate distance metric at startup (fail fast)
 space = (collection.metadata or {}).get("hnsw:space", "l2")
 print(f"   Distance metric: {space}")
 if space != "cosine":
     print(
         f"\n⛔  FATAL: Collection metric is '{space}', expected 'cosine'.\n"
         "    Re-run embeddings.py to recreate the collection with the correct metric.\n"
-        "    Do NOT continue — retrieval results will be meaningless.\n"
     )
     sys.exit(1)
 
@@ -94,62 +116,19 @@ if tokenizer.pad_token is None:
     tokenizer.pad_token    = tokenizer.eos_token
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
-# ================= QUESTION TYPE DETECTION =================
-def detect_question_type(question: str) -> str:
-    """
-    Enhanced question type detection including point/list format requests.
-    """
-    q = question.lower()
 
-    # Explicit formatting requests — check FIRST before semantic type
-    if any(p in q for p in [
-        "in points", "as points", "point by point", "in bullet", "as bullets",
-        "bullet points", "numbered list", "as a list", "list format",
-        "step by step", "in steps", "one by one", "enumerate"
-    ]):
-        return "points"
+# =============================================================================
+#  RETRIEVAL STAGE 1 — Bi-encoder candidate retrieval
+# =============================================================================
 
-    # Procedure / how-to
-    if any(q.startswith(p) for p in ["how do", "how to", "how does", "procedure", "steps", "process"]):
-        return "procedure"
-
-    # Definition
-    if any(q.startswith(p) for p in ["what is", "what are", "define", "meaning of"]):
-        return "definition"
-
-    # Explanation
-    if any(q.startswith(p) for p in ["explain", "describe", "tell me about", "overview", "elaborate"]):
-        return "explanation"
-
-    # List / enumeration
-    if any(w in q for w in ["list", "mention all", "what are all", "give all", "types of", "kinds of"]):
-        return "list"
-
-    # Safety / guidelines
-    if any(w in q for w in ["safety", "measures", "precautions", "guidelines", "requirements", "rules"]):
-        return "list"
-
-    # Reason / cause
-    if any(w in q for w in ["why", "reason", "cause", "purpose", "benefit", "advantage", "disadvantage"]):
-        return "explanation"
-
-    # Comparison
-    if any(w in q for w in ["compare", "difference", "vs", "versus", "distinguish", "contrast"]):
-        return "comparison"
-
-    return "general"
-
-
-# ================= ENHANCED RETRIEVAL =================
-def retrieve_with_reranking(
+def biencoder_retrieve(
     query: str,
-    k: int = 10,
-    top_k: int = 5,
-    threshold: float = 0.45,
-    verbose: bool = True
-) -> Tuple[List[str], List[float]]:
+    k: int = 20,
+    verbose: bool = True,
+) -> Tuple[List[str], List[float], List[dict]]:
     """
-    Enhanced retrieval with semantic reranking and keyword boost.
+    Stage 1: Use the bi-encoder + ChromaDB to get top-k candidates quickly.
+    Returns (docs, cosine_similarities, metadatas).
     """
     q_vec = embedder.encode(
         [query],
@@ -158,7 +137,7 @@ def retrieve_with_reranking(
     ).tolist()
 
     if verbose:
-        print(f"Query vector norm: {np.linalg.norm(q_vec[0]):.4f}")
+        print(f"  Bi-encoder query vector norm: {np.linalg.norm(q_vec[0]):.4f}")
 
     results = collection.query(
         query_embeddings=q_vec,
@@ -170,94 +149,218 @@ def retrieve_with_reranking(
     distances = results["distances"][0]
     metadatas = results.get("metadatas", [[{}] * len(docs)])[0]
 
-    candidates = []
-    query_terms = set(query.lower().split())
-
-    for doc, dist, meta in zip(docs, distances, metadatas):
-        similarity = 1.0 - (dist / 2.0)
-
-        doc_lower = doc.lower()
-        keyword_matches = sum(1 for term in query_terms if len(term) > 3 and term in doc_lower)
-        keyword_boost = min(0.08 * keyword_matches, 0.2)
-
-        boosted_similarity = min(similarity + keyword_boost, 1.0)
-
-        candidates.append({
-            'doc': doc,
-            'similarity': similarity,
-            'boosted_similarity': boosted_similarity,
-            'metadata': meta
-        })
-
-    candidates.sort(key=lambda x: x['boosted_similarity'], reverse=True)
+    # Convert cosine distance → cosine similarity
+    similarities = [1.0 - (d / 2.0) for d in distances]
 
     if verbose:
-        print("\n📊 Retrieval Results:")
-        print(f"{'Rank':<5} {'Dist':<10} {'Sim':<8} {'Boosted':<8} {'Content':<50}")
-        print("-" * 80)
-        for i, cand in enumerate(candidates[:top_k], 1):
-            orig_sim  = cand['similarity']
-            boost_sim = cand['boosted_similarity']
-            content   = cand['doc'][:45] + "..." if len(cand['doc']) > 45 else cand['doc']
-            print(f"{i:<5} {(2*(1-orig_sim)):<10.4f} {orig_sim:<8.4f} {boost_sim:<8.4f} {content:<50}")
+        print(f"  Retrieved {len(docs)} candidates from ChromaDB")
 
-    # Require top result to be meaningful
-    if candidates and candidates[0]['boosted_similarity'] < 0.45:
-        print(f"\n⚠ Weak retrieval (top similarity={candidates[0]['boosted_similarity']:.3f})")
+    return docs, similarities, metadatas
+
+
+# =============================================================================
+#  RETRIEVAL STAGE 2 — Cross-encoder reranking
+# =============================================================================
+
+def crossencoder_rerank(
+    query: str,
+    docs: List[str],
+    bi_scores: List[float],
+    top_k: int = 5,
+    verbose: bool = True,
+) -> Tuple[List[str], List[float]]:
+    """
+    Stage 2: Rerank candidates using cross-encoder relevance scores.
+
+    Cross-encoder reads (query, document) together — much more accurate than
+    bi-encoder cosine similarity because it models interaction between query
+    and document tokens directly.
+
+    Returns (reranked_docs, reranker_scores) sorted best-first.
+    """
+    if not docs:
         return [], []
 
-    filtered = []
-    scores   = []
-    for cand in candidates[:top_k]:
-        if cand['boosted_similarity'] >= threshold:
-            filtered.append(cand['doc'])
-            scores.append(cand['boosted_similarity'])
+    # Build (query, doc) pairs for cross-encoder
+    pairs = [(query, doc) for doc in docs]
 
-    print(f"\n🔎 Retrieved {len(filtered)} / {top_k} chunks (threshold={threshold})")
-    return filtered, scores
+    # Score all pairs — cross-encoder returns raw logits (higher = more relevant)
+    ce_scores = reranker.predict(pairs, show_progress_bar=False)
+
+    if verbose:
+        print(f"\n{'─'*70}")
+        print(f"  {'Rank':<5} {'CE Score':<12} {'Bi-Sim':<10} {'Document preview':<40}")
+        print(f"{'─'*70}")
+
+    # Combine bi-encoder + cross-encoder scores
+    # CE score is dominant; bi-encoder acts as a tie-breaker
+    combined = []
+    for i, (doc, ce_score, bi_score) in enumerate(zip(docs, ce_scores, bi_scores)):
+        combined.append({
+            "doc":      doc,
+            "ce_score": float(ce_score),
+            "bi_score": float(bi_score),
+            # Normalise bi_score contribution so CE dominates
+            "final":    float(ce_score) * 0.85 + float(bi_score) * 0.15,
+        })
+
+    # Sort by final score descending
+    combined.sort(key=lambda x: x["final"], reverse=True)
+
+    if verbose:
+        for rank, item in enumerate(combined[:top_k], 1):
+            preview = item["doc"][:42] + "..." if len(item["doc"]) > 42 else item["doc"]
+            print(f"  {rank:<5} {item['ce_score']:<12.4f} {item['bi_score']:<10.4f} {preview}")
+        print(f"{'─'*70}")
+
+    top_docs   = [item["doc"]      for item in combined[:top_k]]
+    top_scores = [item["ce_score"] for item in combined[:top_k]]
+
+    return top_docs, top_scores
 
 
-# ================= CONTEXT CLEANING =================
+# =============================================================================
+#  RETRIEVAL STAGE 2 (fallback) — keyword-boosted bi-encoder reranking
+# =============================================================================
+
+def biencoder_rerank(
+    query: str,
+    docs: List[str],
+    bi_scores: List[float],
+    top_k: int = 5,
+    threshold: float = 0.45,
+    verbose: bool = True,
+) -> Tuple[List[str], List[float]]:
+    """
+    Fallback reranker when cross-encoder is not available.
+    Boosts bi-encoder scores with keyword overlap.
+    """
+    query_terms = set(query.lower().split())
+    candidates  = []
+
+    for doc, score in zip(docs, bi_scores):
+        doc_lower = doc.lower()
+        matches   = sum(1 for t in query_terms if len(t) > 3 and t in doc_lower)
+        boost     = min(0.08 * matches, 0.2)
+        candidates.append({
+            "doc":    doc,
+            "score":  min(score + boost, 1.0),
+            "raw":    score,
+        })
+
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+
+    if verbose:
+        print(f"\n{'─'*70}")
+        print(f"  {'Rank':<5} {'Boosted':<10} {'Raw Sim':<10} {'Document preview':<40}")
+        print(f"{'─'*70}")
+        for i, c in enumerate(candidates[:top_k], 1):
+            preview = c["doc"][:42] + "..." if len(c["doc"]) > 42 else c["doc"]
+            print(f"  {i:<5} {c['score']:<10.4f} {c['raw']:<10.4f} {preview}")
+        print(f"{'─'*70}")
+
+    filtered = [c for c in candidates[:top_k] if c["score"] >= threshold]
+    return [c["doc"] for c in filtered], [c["score"] for c in filtered]
+
+
+# =============================================================================
+#  FULL RETRIEVAL PIPELINE  (bi-encoder → reranker)
+# =============================================================================
+
+def retrieve_and_rerank(
+    query: str,
+    candidate_k: int = 20,
+    top_k: int = 5,
+    threshold: float = 0.45,
+    verbose: bool = True,
+) -> Tuple[List[str], List[float]]:
+    """
+    Full two-stage retrieval:
+      Stage 1 — bi-encoder fetches `candidate_k` chunks from ChromaDB (fast)
+      Stage 2 — cross-encoder reranks and returns best `top_k` (accurate)
+
+    If cross-encoder is unavailable, falls back to keyword-boosted bi-encoder.
+
+    Args:
+        query       : user question
+        candidate_k : how many candidates to pull from ChromaDB (cast wide)
+        top_k       : how many to return after reranking
+        threshold   : minimum score to accept a chunk
+        verbose     : print debug tables
+    """
+    print(f"\n📡 Stage 1 — Bi-encoder retrieval (k={candidate_k})...")
+    docs, bi_scores, _ = biencoder_retrieve(query, k=candidate_k, verbose=verbose)
+
+    if not docs:
+        return [], []
+
+    # Hard check: if best bi-encoder score is terrible, bail early
+    if bi_scores and bi_scores[0] < 0.35:
+        print(f"⚠  Very low bi-encoder score ({bi_scores[0]:.3f}) — query may be out of domain")
+        return [], []
+
+    if cross_encoder_available:
+        print(f"🎯 Stage 2 — Cross-encoder reranking (top_k={top_k})...")
+        reranked_docs, reranked_scores = crossencoder_rerank(
+            query, docs, bi_scores, top_k=top_k, verbose=verbose
+        )
+
+        # Cross-encoder scores are logits — no fixed threshold; take top_k as-is
+        # but drop anything the CE scored very low (< -5 is clearly irrelevant)
+        filtered_docs   = []
+        filtered_scores = []
+        for doc, score in zip(reranked_docs, reranked_scores):
+            if score > -5.0:
+                filtered_docs.append(doc)
+                filtered_scores.append(score)
+
+        print(f"✅ Cross-encoder selected {len(filtered_docs)} chunks")
+        return filtered_docs, filtered_scores
+
+    else:
+        print(f"🔄 Stage 2 — Keyword-boosted reranking (fallback, top_k={top_k})...")
+        return biencoder_rerank(
+            query, docs, bi_scores,
+            top_k=top_k, threshold=threshold, verbose=verbose
+        )
+
+
+# =============================================================================
+#  CONTEXT CLEANING
+# =============================================================================
+
 def clean_context(context: str, preserve_structure: bool = True) -> str:
-    """
-    Clean context while preserving structural information.
-    """
     cleaned    = []
     lines      = context.splitlines()
 
     for line in lines:
         line = line.strip()
-
         if not line:
             if preserve_structure and cleaned and cleaned[-1] != "":
                 cleaned.append("")
             continue
 
         lower = line.lower()
-        if any(phrase in lower for phrase in [
+        if any(p in lower for p in [
             "page intentionally left blank",
             "this page intentionally",
-            "continued on next page"
+            "continued on next page",
         ]):
             continue
 
-        # Always keep headers, bullets, numbered items
         if re.match(r'^(\d+\.|\*|-|•|[A-Z][A-Z\s]+:)', line):
             cleaned.append(line)
             continue
 
-        # Keep lines with technical markers
-        if any(char in line for char in ['=', ':', '(', ')', '%', '@']):
+        if any(c in line for c in ['=', ':', '(', ')', '%', '@']):
             cleaned.append(line)
             continue
 
-        # Drop very short non-numeric lines
         if len(line) < 20 and not any(c.isdigit() for c in line):
             continue
 
         cleaned.append(line)
 
-    # Collapse multiple blank lines
     final      = []
     prev_empty = False
     for line in cleaned:
@@ -272,13 +375,54 @@ def clean_context(context: str, preserve_structure: bool = True) -> str:
     return "\n".join(final)
 
 
-# ================= PROMPT BUILDER =================
-def build_prompt(context: str, question: str, qtype: str, similarity_score: float = None) -> str:
-    """
-    Build a prompt tailored to question type, especially for point/list formats.
-    """
+# =============================================================================
+#  QUESTION TYPE DETECTION
+# =============================================================================
 
-    # ── Format instructions per question type ──────────────────────────────
+def detect_question_type(question: str) -> str:
+    q = question.lower()
+
+    if any(p in q for p in [
+        "in points", "as points", "point by point", "in bullet", "as bullets",
+        "bullet points", "numbered list", "as a list", "list format",
+        "step by step", "in steps", "one by one", "enumerate",
+    ]):
+        return "points"
+
+    if any(q.startswith(p) for p in ["how do", "how to", "how does", "procedure", "steps", "process"]):
+        return "procedure"
+
+    if any(q.startswith(p) for p in ["what is", "what are", "define", "meaning of"]):
+        return "definition"
+
+    if any(q.startswith(p) for p in ["explain", "describe", "tell me about", "overview", "elaborate"]):
+        return "explanation"
+
+    if any(w in q for w in ["list", "mention all", "what are all", "give all", "types of", "kinds of"]):
+        return "list"
+
+    if any(w in q for w in ["safety", "measures", "precautions", "guidelines", "requirements", "rules"]):
+        return "list"
+
+    if any(w in q for w in ["why", "reason", "cause", "purpose", "benefit", "advantage", "disadvantage"]):
+        return "explanation"
+
+    if any(w in q for w in ["compare", "difference", "vs", "versus", "distinguish", "contrast"]):
+        return "comparison"
+
+    return "general"
+
+
+# =============================================================================
+#  PROMPT BUILDER
+# =============================================================================
+
+def build_prompt(
+    context: str,
+    question: str,
+    qtype: str,
+    similarity_score: Optional[float] = None,
+) -> str:
     format_instructions = {
         "definition": (
             "Write a clear, precise definition. "
@@ -290,20 +434,18 @@ def build_prompt(context: str, question: str, qtype: str, similarity_score: floa
         ),
         "procedure": (
             "List the steps as a numbered list:\n"
-            "1. First step\n"
-            "2. Second step\n"
-            "...\n"
+            "1. First step\n2. Second step\n...\n"
             "Use only steps described in the context."
         ),
         "points": (
-            "Answer using a numbered or bulleted list. Each point must be a complete, "
-            "informative sentence drawn directly from the context. "
-            "Format:\n1. [Point one]\n2. [Point two]\n3. [Point three]\n..."
-            "\nDo NOT write paragraphs — use ONLY the list format."
+            "Answer using a numbered list. Each point must be a complete, "
+            "informative sentence drawn directly from the context.\n"
+            "Format:\n1. [Point one]\n2. [Point two]\n3. [Point three]\n...\n"
+            "Do NOT write paragraphs — use ONLY the list format."
         ),
         "list": (
             "List all relevant items mentioned in the context. "
-            "Use a numbered or bulleted format with a brief explanation for each item."
+            "Use a numbered or bulleted format with a brief explanation for each."
         ),
         "comparison": (
             "Compare the items by highlighting their key differences and similarities "
@@ -317,26 +459,24 @@ def build_prompt(context: str, question: str, qtype: str, similarity_score: floa
 
     style_instruction = format_instructions.get(qtype, format_instructions["general"])
 
-    # ── Confidence hint ────────────────────────────────────────────────────
     confidence_note = ""
-    if similarity_score is not None:
-        if similarity_score < 0.55:
-            confidence_note = (
-                "\nNote: Context relevance is moderate. Answer only what is "
-                "explicitly supported by the context."
-            )
+    if similarity_score is not None and similarity_score < 0.55:
+        confidence_note = (
+            "\nNote: Context relevance is moderate. "
+            "Answer only what is explicitly supported by the context."
+        )
 
     messages = [
         {
             "role": "system",
             "content": (
-                "You are a precise technical assistant. Your job is to answer questions "
-                "using ONLY the information in the provided context.\n\n"
+                "You are a precise technical assistant. Answer questions using "
+                "ONLY the information in the provided context.\n\n"
                 "RULES:\n"
                 "1. Use ONLY facts explicitly stated in the context.\n"
-                "2. Do NOT add outside knowledge, assumptions, or general knowledge.\n"
-                "3. If the context does not contain enough information, say: "
-                "   'The available context does not contain sufficient information to answer this.'\n"
+                "2. Do NOT add outside knowledge or assumptions.\n"
+                "3. If context is insufficient, say: 'The available context does not "
+                "contain sufficient information to answer this.'\n"
                 "4. Mirror the vocabulary and terminology used in the context.\n"
                 "5. Follow the response format instruction exactly.\n\n"
                 f"RESPONSE FORMAT: {style_instruction}"
@@ -358,25 +498,21 @@ def build_prompt(context: str, question: str, qtype: str, similarity_score: floa
     )
 
 
-# ================= ANSWER CLEANING =================
+# =============================================================================
+#  ANSWER CLEANING & VALIDATION
+# =============================================================================
+
 def clean_generated_answer(answer: str) -> str:
-    """
-    Minimal cleaning — only remove chat template artifacts.
-    Preserve lists, bullets, and formatting from the model output.
-    """
-    # Remove chat template leakage
     for marker in ["<|im_start|>assistant", "<|im_start|>", "<|im_end|>"]:
         if marker in answer:
-            parts = answer.split(marker)
+            parts  = answer.split(marker)
             answer = parts[-1] if marker == "<|im_start|>assistant" else parts[0]
 
-    # Remove leading role labels if present
     answer = re.sub(r'^(assistant|system|user)\s*[:\n]', '', answer, flags=re.IGNORECASE).strip()
 
-    # Remove repeated question echo at the start
-    lines = answer.splitlines()
+    lines         = answer.splitlines()
     cleaned_lines = []
-    skip_echo = True
+    skip_echo     = True
     for line in lines:
         stripped = line.strip()
         if skip_echo and (not stripped or stripped.endswith("?")):
@@ -385,23 +521,14 @@ def clean_generated_answer(answer: str) -> str:
         cleaned_lines.append(line)
 
     answer = "\n".join(cleaned_lines).strip()
-
-    # Collapse excessive blank lines (keep max 1)
     answer = re.sub(r'\n{3,}', '\n\n', answer)
-
     return answer.strip()
 
 
-# ================= ANSWER VALIDATION =================
-def validate_answer(answer: str, context: str, question: str) -> bool:
-    """
-    Relaxed validation — checks answer is non-trivial and not a hallucination refusal.
-    Does NOT enforce strict word-overlap (this was causing list/point answers to fail).
-    """
+def validate_answer(answer: str) -> bool:
     if not answer or len(answer.split()) < 5:
         return False
 
-    # Reject if model refused to use context and fell back to general AI behaviour
     refusal_phrases = [
         "as an ai language model",
         "i don't have access to",
@@ -409,40 +536,53 @@ def validate_answer(answer: str, context: str, question: str) -> bool:
         "i cannot provide information",
         "my knowledge cutoff",
     ]
-    answer_lower = answer.lower()
-    if any(phrase in answer_lower for phrase in refusal_phrases):
+    if any(p in answer.lower() for p in refusal_phrases):
         return False
 
-    # Reject completely empty / one-word answers
     if len(answer.strip()) < 20:
         return False
 
     return True
 
 
-# ================= CONTEXT RELEVANCE CHECK =================
+def ensure_complete_sentence(text: str) -> str:
+    if not text:
+        return text
+    text = text.strip()
+    if text and text[-1] not in ".!?":
+        last_line = text.splitlines()[-1].strip() if text.splitlines() else ""
+        if re.match(r'^\d+\.', last_line) or last_line.startswith(('-', '•', '*')):
+            return text
+        if len(text.split()) > 5:
+            return text + "."
+    return text
+
+
 def validate_context_relevance(context: str, question: str) -> float:
-    """
-    Loose check: returns fraction of meaningful question terms found in context.
-    """
     question_terms = set(question.lower().split())
     context_lower  = context.lower()
-    matches = sum(1 for term in question_terms if len(term) > 3 and term in context_lower)
-    return matches / max(len([t for t in question_terms if len(t) > 3]), 1)
+    meaningful     = [t for t in question_terms if len(t) > 3]
+    if not meaningful:
+        return 1.0
+    matches = sum(1 for t in meaningful if t in context_lower)
+    return matches / len(meaningful)
 
 
-# ================= GENERATION =================
-def generate_answer(context: str, question: str, similarity_score: float = None) -> str:
-    """
-    Generate answer with format-aware prompting and relaxed validation.
-    """
+# =============================================================================
+#  ANSWER GENERATION
+# =============================================================================
+
+def generate_answer(
+    context: str,
+    question: str,
+    similarity_score: Optional[float] = None,
+) -> str:
     qtype   = detect_question_type(question)
     context = clean_context(context, preserve_structure=True)
 
     if not context.strip() or len(context.split()) < 15:
         return "Insufficient context available to answer this question."
 
-    # Only hard-reject if context has zero semantic relation to question
     relevance = validate_context_relevance(context, question)
     if relevance < 0.05:
         return "The retrieved context does not appear to contain relevant information for this question."
@@ -456,10 +596,6 @@ def generate_answer(context: str, question: str, similarity_score: float = None)
         max_length=2048,
     ).to(device)
 
-    # ── Generation parameters ────────────────────────────────────────────
-    # temperature=0.4 gives slightly more flexibility for reformatting
-    # top_p=0.9, top_k=50 gives richer vocabulary for list items
-    # max_new_tokens=512 allows full point-format answers
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
@@ -475,75 +611,64 @@ def generate_answer(context: str, question: str, similarity_score: float = None)
 
     generated_tokens = outputs[0][inputs["input_ids"].shape[-1]:]
     answer = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
-
     answer = clean_generated_answer(answer)
 
-    if not validate_answer(answer, context, question):
+    if not validate_answer(answer):
         return "Unable to provide a reliable answer based on the available context."
 
     return answer
 
 
-# ================= COMPLETE SENTENCE HELPER =================
-def ensure_complete_sentence(text: str) -> str:
-    """
-    Only add a trailing period if text doesn't end with punctuation.
-    Does NOT truncate — preserves lists and bullet points fully.
-    """
-    if not text:
-        return text
-    text = text.strip()
-    if text and text[-1] not in ".!?":
-        # Check if last line is a list item — don't truncate
-        last_line = text.splitlines()[-1].strip() if text.splitlines() else ""
-        if re.match(r'^\d+\.', last_line) or last_line.startswith(('-', '•', '*')):
-            return text  # Leave list as-is
-        if len(text.split()) > 5:
-            return text + "."
-    return text
+# =============================================================================
+#  MAIN RAG PIPELINE
+# =============================================================================
 
-
-# ================= MAIN RAG PIPELINE =================
-def ask(question: str, threshold: float = 0.45, use_reranking: bool = True) -> str:
+def ask(
+    question: str,
+    candidate_k: int = 20,
+    top_k: int = 5,
+    threshold: float = 0.45,
+) -> str:
     """
-    Full RAG pipeline with format-aware answer generation.
+    Full RAG pipeline:
+      1. Bi-encoder retrieves `candidate_k` candidates from ChromaDB
+      2. Cross-encoder reranks → selects best `top_k`  (or keyword-boost fallback)
+      3. Deduplicate chunks
+      4. Generate answer with format-aware prompting
     """
     print(f"\n{'='*60}")
-    print(f"QUERY: {question}")
-    qtype = detect_question_type(question)
-    print(f"TYPE:  {qtype}")
+    print(f"QUERY : {question}")
+    print(f"TYPE  : {detect_question_type(question)}")
+    print(f"RERANK: {'Cross-encoder' if cross_encoder_available else 'Keyword-boost (fallback)'}")
     print('='*60)
 
-    if use_reranking:
-        docs, scores = retrieve_with_reranking(
+    docs, scores = retrieve_and_rerank(
+        question,
+        candidate_k=candidate_k,
+        top_k=top_k,
+        threshold=threshold,
+        verbose=True,
+    )
+
+    # Retry with looser candidate pool if nothing found
+    if not docs:
+        print(f"⚠  No results — retrying with larger candidate pool (k={candidate_k + 10})...")
+        docs, scores = retrieve_and_rerank(
             question,
-            k=12,
-            top_k=6,
-            threshold=threshold
+            candidate_k=candidate_k + 10,
+            top_k=top_k + 3,
+            threshold=max(threshold - 0.10, 0.25),
+            verbose=False,
         )
-    else:
-        docs   = retrieve(question, k=8, threshold=threshold)
-        scores = [threshold] * len(docs)
 
     if not docs:
-        fallback_threshold = threshold - 0.15
-        print(f"⚠  No results at threshold={threshold}. Trying {fallback_threshold:.2f}...")
-        if use_reranking:
-            docs, scores = retrieve_with_reranking(
-                question, k=15, top_k=8, threshold=fallback_threshold, verbose=False
-            )
-        else:
-            docs   = retrieve(question, k=10, threshold=fallback_threshold, verbose=False)
-            scores = [fallback_threshold] * len(docs)
+        return "I don't have sufficient information in the knowledge base to answer this question."
 
-        if not docs:
-            return "I don't have sufficient information in the knowledge base to answer this question."
-
-    # Deduplicate chunks
+    # Deduplicate
     seen        = set()
     unique_docs = []
     for doc in docs:
-        key = doc[:100] if len(doc) > 100 else doc
+        key = doc[:100]
         if key not in seen:
             seen.add(key)
             unique_docs.append(doc)
@@ -553,61 +678,19 @@ def ask(question: str, threshold: float = 0.45, use_reranking: bool = True) -> s
     if len(context.split()) < 20:
         return "The retrieved information is too limited to provide a reliable answer."
 
+    # Use cross-encoder score for confidence hint if available;
+    # otherwise fall back to bi-encoder similarity
     avg_score = sum(scores) / len(scores) if scores else 0
     answer    = generate_answer(context, question, avg_score)
 
     return ensure_complete_sentence(answer)
 
 
-# ================= ORIGINAL RETRIEVE (BACKWARD COMPAT) =================
-def retrieve(
-    query: str,
-    k: int = 5,
-    threshold: float = 0.35,
-    verbose: bool = True
-) -> List[str]:
-    """Original retrieve — kept for backward compatibility."""
-    q_vec = embedder.encode(
-        [query], normalize_embeddings=True, convert_to_numpy=True
-    ).tolist()
+# =============================================================================
+#  STARTUP DIAGNOSTIC
+# =============================================================================
 
-    if verbose:
-        print(f"Query vector norm: {np.linalg.norm(q_vec[0]):.4f}")
-
-    results = collection.query(
-        query_embeddings=q_vec,
-        n_results=k,
-        include=["documents", "distances"],
-    )
-
-    docs      = results["documents"][0]
-    distances = results["distances"][0]
-
-    similarities    = []
-    filtered_docs   = []
-
-    for rank, (doc, dist) in enumerate(zip(docs, distances), 1):
-        similarity = 1.0 - (dist / 2.0)
-        similarities.append(similarity)
-        if verbose:
-            print(f"{rank:<5} {dist:>8.4f} {similarity:>11.4f}  {doc[:55]}...")
-
-    top_similarity = similarities[0] if similarities else 0
-    if top_similarity < 0.50:
-        print(f"⚠ Weak retrieval (top similarity={top_similarity:.3f})")
-        return []
-
-    for doc, sim in zip(docs, similarities):
-        if sim >= threshold:
-            filtered_docs.append(doc)
-
-    print(f"\n🔎 Retrieved {len(filtered_docs)} / {len(docs)} chunks (threshold={threshold})")
-    return filtered_docs
-
-
-# ================= STARTUP DIAGNOSTIC =================
 def run_startup_diagnostic():
-    """Check embedding quality and retrieval health at startup."""
     print("\n" + "="*60)
     print(" STARTUP DIAGNOSTIC")
     print("="*60)
@@ -616,60 +699,60 @@ def run_startup_diagnostic():
         sample = collection.get(limit=10, include=["embeddings", "documents"])
 
         if not sample["embeddings"]:
-            print("❌ ERROR: No embeddings found in collection!")
+            print("❌ ERROR: No embeddings found!")
             return
 
         embed_dim = len(sample["embeddings"][0])
-        print(f"✓ Embedding dimension: {embed_dim}")
+        print(f"✓ Embedding dimension : {embed_dim}")
 
         norms    = [np.linalg.norm(e) for e in sample["embeddings"]]
         avg_norm = np.mean(norms)
-        std_norm = np.std(norms)
-        print(f"✓ Vector norms: mean={avg_norm:.4f}, std={std_norm:.4f}")
+        print(f"✓ Vector norms        : mean={avg_norm:.4f}, std={np.std(norms):.4f}")
 
         if not all(0.95 < n < 1.05 for n in norms[:5]):
-            print("⚠ WARNING: Vectors may not be properly normalized!")
+            print("⚠ Vectors may not be properly normalized!")
         else:
             print("✓ Vectors are properly normalized")
 
         # Self-retrieval test
         print("\n📊 Self-Retrieval Test:")
         test_doc     = sample["documents"][0]
-        test_snippet = test_doc[:200] if len(test_doc) > 200 else test_doc
+        test_snippet = test_doc[:200]
 
         q_vec = embedder.encode(
             [test_snippet], normalize_embeddings=True, convert_to_numpy=True
         ).tolist()
-
         res = collection.query(
-            query_embeddings=q_vec,
-            n_results=3,
+            query_embeddings=q_vec, n_results=3,
             include=["documents", "distances"]
         )
-
         if res["documents"][0]:
-            first_match = res["documents"][0][0]
-            dist        = res["distances"][0][0]
-            sim         = 1.0 - (dist / 2.0)
+            dist = res["distances"][0][0]
+            sim  = 1.0 - (dist / 2.0)
             print(f"  Distance: {dist:.4f}  |  Similarity: {sim:.4f}")
-            if first_match[:100] == test_doc[:100]:
+            if res["documents"][0][0][:100] == test_doc[:100]:
                 print("✓ Exact match — retrieval working correctly")
             elif sim > 0.9:
                 print("✓ High similarity match — retrieval working")
             else:
-                print("⚠ WARNING: Self-retrieval similarity is low — check embedding model")
+                print("⚠ Low self-retrieval similarity — check embedding model")
 
-        # Consistency test
-        print("\n🔍 Embedding Consistency Test:")
-        test_text   = "This is a test sentence for embedding consistency"
-        emb1        = embedder.encode([test_text], normalize_embeddings=True)
-        emb2        = embedder.encode([test_text], normalize_embeddings=True)
-        consistency = np.dot(emb1[0], emb2[0])
-        print(f"  Consistency score: {consistency:.6f}")
-        if consistency > 0.9999:
-            print("✓ Embeddings are deterministic and consistent")
+        # Cross-encoder sanity test
+        if cross_encoder_available:
+            print("\n🎯 Cross-Encoder Test:")
+            test_pairs = [
+                ("What is the system configuration?", test_doc[:300]),
+                ("What is the system configuration?", "This is completely unrelated text about apples."),
+            ]
+            ce_scores = reranker.predict(test_pairs, show_progress_bar=False)
+            print(f"  Relevant doc score   : {ce_scores[0]:.4f}")
+            print(f"  Irrelevant doc score : {ce_scores[1]:.4f}")
+            if ce_scores[0] > ce_scores[1]:
+                print("✓ Cross-encoder correctly ranks relevant doc higher")
+            else:
+                print("⚠ Cross-encoder ranking unexpected — check model")
         else:
-            print("⚠ WARNING: Embeddings may not be deterministic!")
+            print("\n⚠  Cross-encoder not available — using fallback reranker")
 
         print("\n" + "="*60)
         print(" DIAGNOSTIC COMPLETE")
@@ -679,15 +762,21 @@ def run_startup_diagnostic():
         print(f"❌ Diagnostic failed: {e}")
 
 
-# ================= MAIN =================
+# =============================================================================
+#  MAIN
+# =============================================================================
+
 if __name__ == "__main__":
     run_startup_diagnostic()
 
     model_type = "Fine-tuned" if use_finetuned else "Base"
-    print(f"\n✅ Enhanced RAG System Ready")
-    print(f"   Model: {model_type} Qwen2-1.5B")
-    print(f"   Device: {device.upper()}")
-    print(f"   Chunks: {collection.count()}")
+    rerank_type = "Cross-encoder" if cross_encoder_available else "Keyword-boost (fallback)"
+
+    print(f"\n✅ RAG System Ready")
+    print(f"   Model      : {model_type} Qwen2-1.5B")
+    print(f"   Device     : {device.upper()}")
+    print(f"   Chunks     : {collection.count()}")
+    print(f"   Reranker   : {rerank_type}")
     print("\nType 'exit' or 'quit' to stop.")
     print("Type 'help' for usage tips.\n")
 
@@ -713,7 +802,7 @@ if __name__ == "__main__":
             print("  - Rephrased questions work — e.g. 'what does X do?' vs 'explain X'\n")
             continue
 
-        answer = ask(q, threshold=0.45, use_reranking=True)
+        answer = ask(q, candidate_k=20, top_k=5, threshold=0.45)
 
         print(f"\n{'─'*60}")
         print(f"Answer:\n{answer}")
