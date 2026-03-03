@@ -27,10 +27,10 @@ BASE_DIR = Path(__file__).resolve().parent
 MARKDOWN_DIR         = BASE_DIR / "data" / "markdowns"
 CHROMA_DIR           = str(BASE_DIR / "chroma_store")
 COLLECTION_NAME      = "pdf_markdown_embeddings"
-EMBEDDING_MODEL_PATH = r"D:\Machine Learning and LLMs\LLMs\all-MiniLM-L6-v2"
+EMBEDDING_MODEL_PATH = r"D:\Machine Learning and LLMs\LLMs\bge-large-en-v1.5"
 
-CHUNK_SIZE       = 800
-CHUNK_OVERLAP    = 150
+CHUNK_SIZE       = 400
+CHUNK_OVERLAP    = 80
 EMBED_BATCH_SIZE = 256
 
 # =========================
